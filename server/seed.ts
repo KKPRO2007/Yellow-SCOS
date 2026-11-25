@@ -131,6 +131,9 @@ export const DEMO_USERS = [
  * tops history up to yesterday, so a deployed demo keeps 30 fresh days.
  */
 export async function seed(db: Db, today = localNow().date) {
+  // Cold starts happen often on serverless; the full check runs once a day.
+  const [done] = await db.query<{ value: string }>(`SELECT value FROM settings WHERE key = 'seeded_through'`);
+  if (done?.value === today) return;
   await db.tx(async (q) => {
     await q(`SELECT pg_advisory_xact_lock(7311)`);
     for (const [i, m] of MENU.entries()) {
@@ -176,6 +179,10 @@ export async function seed(db: Db, today = localNow().date) {
           [k.id],
         );
     }
+    await q(
+      `INSERT INTO settings (key, value) VALUES ('seeded_through', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [today],
+    );
   });
 }
 

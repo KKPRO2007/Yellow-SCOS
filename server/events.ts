@@ -38,7 +38,8 @@ export function stream(req: Request, res: Response) {
     clients.add(res);
   } else {
     const d = db;
-    let last = Number(req.headers['last-event-id']) || 0;
+    // Resume point: the browser's Last-Event-ID, or ?last= when it reconnects itself.
+    let last = Number(req.headers['last-event-id']) || Number(req.query?.last) || 0;
     let busy = false;
     const tick = async () => {
       if (busy) return;
@@ -65,7 +66,17 @@ export function stream(req: Request, res: Response) {
     };
     tick();
     timers.push(setInterval(tick, POLL_MS));
-    timers.push(setTimeout(() => res.end(), MAX_STREAM_MS) as unknown as ReturnType<typeof setInterval>);
+    // Say goodbye before the platform cuts us off, so the browser reconnects
+    // at once (from `last`) instead of seeing an error.
+    timers.push(
+      setTimeout(() => {
+        res.write(`event: bye
+data: {"last":${last}}
+
+`);
+        res.end();
+      }, MAX_STREAM_MS) as unknown as ReturnType<typeof setInterval>,
+    );
   }
 
   req.on('close', () => {

@@ -109,21 +109,63 @@ const listeners = new Map<Topic, Set<(e: LiveEvent) => void>>();
 let source: EventSource | null = null;
 const connListeners = new Set<(up: boolean) => void>();
 
+let lastId = '';
+let downSince = 0;
+let offlineTimer: ReturnType<typeof setTimeout> | null = null;
+const ALL: Topic[] = ['slots', 'orders', 'menu', 'settings', 'stock'];
+
+function setUp(up: boolean) {
+  connListeners.forEach((fn) => fn(up));
+}
+
+/**
+ * One live connection for the whole app. Serverless hosts end streams every
+ * few minutes; that is normal, so we reconnect at once from the last event
+ * seen and only call it "offline" if we stay disconnected for 6 seconds.
+ * After a real outage every screen refetches, so nothing missed stays stale.
+ */
 function ensureStream() {
   if (source) return;
-  source = new EventSource('/api/stream');
-  for (const t of ['slots', 'orders', 'menu', 'settings', 'stock'] as Topic[])
+  source = new EventSource(`/api/stream${lastId ? `?last=${encodeURIComponent(lastId)}` : ''}`);
+  for (const t of ALL)
     source.addEventListener(t, (ev) => {
+      const me = ev as MessageEvent;
+      if (me.lastEventId) lastId = me.lastEventId;
       let data: LiveEvent = {};
       try {
-        data = JSON.parse((ev as MessageEvent).data);
+        data = JSON.parse(me.data);
       } catch {
         /* ignore */
       }
       listeners.get(t)?.forEach((fn) => fn(data));
     });
-  source.onopen = () => connListeners.forEach((fn) => fn(true));
-  source.onerror = () => connListeners.forEach((fn) => fn(false));
+  source.addEventListener('bye', () => reopen(0));
+  source.onopen = () => {
+    if (offlineTimer) clearTimeout(offlineTimer);
+    offlineTimer = null;
+    if (downSince && Date.now() - downSince > 3000) ALL.forEach((t) => listeners.get(t)?.forEach((fn) => fn({})));
+    downSince = 0;
+    setUp(true);
+  };
+  source.onerror = () => {
+    if (!downSince) downSince = Date.now();
+    offlineTimer ??= setTimeout(() => setUp(false), 6000);
+    // The browser retries by itself while CONNECTING; if it gave up, we retry.
+    if (source?.readyState === EventSource.CLOSED) reopen(2000);
+  };
+}
+
+function reopen(delay: number) {
+  source?.close();
+  source = null;
+  setTimeout(ensureStream, delay);
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', () => reopen(0));
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && (!source || source.readyState === EventSource.CLOSED)) reopen(0);
+  });
 }
 
 export function useConnected() {

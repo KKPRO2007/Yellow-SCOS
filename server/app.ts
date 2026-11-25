@@ -5,7 +5,7 @@ import path from 'node:path';
 import { aiProviders, briefing, purchaseNote } from './ai.js';
 import { getAnalysis, invalidateAnalysis } from './analytics.js';
 import { createSession, hashPassword, loadUser, requireRole, verifyPassword } from './auth.js';
-import { SCHEMA, connect, type Db } from './db.js';
+import { connect, migrate, type Db } from './db.js';
 import { initEvents, publish, stream } from './events.js';
 import { HttpError, getSettings, placeOrder, seedToday, setStatus, slotBoard } from './ordering.js';
 import { seed } from './seed.js';
@@ -19,7 +19,7 @@ const wrap =
 export async function createApp(given?: Db) {
   const db: Db = given ?? (await connect());
   initEvents(db, Boolean(process.env.VERCEL) || process.env.EVENTS === 'db');
-  await db.exec(SCHEMA);
+  await migrate(db);
   await seed(db);
   await seedToday(db);
 

@@ -15,29 +15,59 @@ export interface Db {
  * DATABASE_URL unset -> PGlite: real Postgres compiled to WASM, in-process.
  *   PGLITE_DIR set   -> persisted to that folder; unset -> in memory (tests).
  */
+/** Errors worth one retry: Neon closed an idle connection, or a deadlock victim. */
+function transient(err: unknown) {
+  const e = err as { code?: string; message?: string };
+  return (
+    ['ECONNRESET', 'EPIPE', 'ETIMEDOUT', '57P01', '08006', '08003', '08001', '40P01', '40001'].includes(e?.code ?? '') ||
+    /Connection terminated|connection timeout|Client has encountered a connection error/i.test(e?.message ?? '')
+  );
+}
+async function retry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (!transient(err)) throw err;
+    await new Promise((r) => setTimeout(r, 150 + Math.random() * 250));
+    return fn();
+  }
+}
+
 export async function connect(url = process.env.DATABASE_URL): Promise<Db> {
   if (url) {
-    const pool = new pg.Pool({ connectionString: url, max: 8 });
+    const pool = new pg.Pool({
+      // verify-full is what pg already does for sslmode=require; saying so silences its warning.
+      connectionString: url.replace(/sslmode=require/, 'sslmode=verify-full'),
+      max: 8,
+      idleTimeoutMillis: 10_000, // drop idle sockets before Neon does
+      connectionTimeoutMillis: 10_000,
+      keepAlive: true,
+    });
+    // Neon closes idle connections (and all of them when it scales to zero).
+    // Without this listener that error would crash the whole function.
+    pool.on('error', (err) => console.warn('pg pool: idle client error:', err.message));
     return {
       kind: 'neon',
-      query: async (sql, params) => (await pool.query(sql, params as any[])).rows,
+      query: (sql, params) => retry(async () => (await pool.query(sql, params as any[])).rows),
       exec: async (sql) => {
-        await pool.query(sql);
+        await retry(() => pool.query(sql));
       },
-      tx: async (fn) => {
-        const client = await pool.connect();
-        try {
-          await client.query('BEGIN');
-          const result = await fn(async (sql, params) => (await client.query(sql, params as any[])).rows);
-          await client.query('COMMIT');
-          return result;
-        } catch (err) {
-          await client.query('ROLLBACK');
-          throw err;
-        } finally {
-          client.release();
-        }
-      },
+      tx: (fn) =>
+        retry(async () => {
+          const client = await pool.connect();
+          let broken: Error | undefined;
+          try {
+            await client.query('BEGIN');
+            const result = await fn(async (sql, params) => (await client.query(sql, params as any[])).rows);
+            await client.query('COMMIT');
+            return result;
+          } catch (err) {
+            await client.query('ROLLBACK').catch((e: Error) => (broken = e));
+            throw err;
+          } finally {
+            client.release(broken); // a dead connection is destroyed, not reused
+          }
+        }),
       close: () => pool.end(),
     };
   }
@@ -167,3 +197,33 @@ CREATE TABLE IF NOT EXISTS events (
   at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 `;
+
+/** Bump when SCHEMA changes; servers only run the DDL when this differs. */
+export const SCHEMA_VERSION = '3';
+
+/**
+ * Create/upgrade tables. ALTER TABLE takes exclusive table locks even when it
+ * changes nothing, so running SCHEMA on every serverless cold start
+ * deadlocked against live traffic. Now: a cheap version check, and only when
+ * it differs, one instance applies SCHEMA under an advisory lock.
+ */
+export async function migrate(db: Db): Promise<boolean> {
+  const has = await db.query<{ t: string | null }>(`SELECT to_regclass('public.settings')::text AS t`);
+  if (has[0]?.t) {
+    const [v] = await db.query<{ value: string }>(`SELECT value FROM settings WHERE key = 'schema_version'`);
+    if (v?.value === SCHEMA_VERSION) return false;
+  }
+  const mark = `INSERT INTO settings (key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
+  if (db.kind === 'pglite') {
+    await db.exec(SCHEMA);
+    await db.query(mark);
+    return true;
+  }
+  await db.tx(async (q) => {
+    await q(`SELECT pg_advisory_xact_lock(7312)`);
+    await q(SCHEMA);
+    await q(mark);
+  });
+  return true;
+}

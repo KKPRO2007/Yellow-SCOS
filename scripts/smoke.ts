@@ -65,7 +65,8 @@ try {
   check('gate: offers next slot', refusal?.body.nextSlot?.slot === '13:15', refusal?.body.message);
 
   const mine = await call('GET', '/orders/mine', undefined, buyer);
-  check('my orders', mine.body.length === placed, `${mine.body.length}, first ready ${mine.body[0]?.readyEta}`);
+  const todayMine = mine.body.filter((o: any) => o.date === health.body.today && o.slot === '13:00');
+  check('my orders', todayMine.length === placed, `${todayMine.length} today at 1 pm, first ready ${todayMine[0]?.readyEta}`);
 
   const kitchen = await call('GET', '/kitchen', undefined, seller);
   check('kitchen', kitchen.status === 200, `${kitchen.body.orders.length} open orders, cook-ahead ${kitchen.body.cookAhead.length} slots`);

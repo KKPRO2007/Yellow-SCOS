@@ -1,7 +1,7 @@
 // Create the schema and load 30 days of fake orders into DATABASE_URL (Neon).
 //   npm run db:seed
 import 'dotenv/config';
-import { SCHEMA, connect } from '../server/db.js';
+import { connect, migrate } from '../server/db.js';
 import { seedToday } from '../server/ordering.js';
 import { seed } from '../server/seed.js';
 
@@ -11,7 +11,7 @@ if (!process.env.DATABASE_URL) {
 }
 const t0 = Date.now();
 const db = await connect();
-await db.exec(SCHEMA);
+await migrate(db);
 await seed(db);
 const today = await seedToday(db);
 const [c] = await db.query<{ users: number; items: number; orders: number; days: number; lines: number }>(
