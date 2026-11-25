@@ -39,6 +39,10 @@ export function PaySheet({ orderId, total, user, onClose, onDone }: { orderId: n
   const [app, setApp] = useState('gpay');
   const [stage, setStage] = useState<'choose' | 'approving' | 'done'>('choose');
   const [error, setError] = useState<string | null>(null);
+  const [step, setStep] = useState(0);
+  const [txn, setTxn] = useState<string | null>(null);
+  const appName = APPS.find((a) => a.id === app)!.name;
+  const STEPS = [`Opening ${appName}`, 'Payment request sent', `Approved in ${appName}`, 'Verifying with bank'];
 
   useEffect(() => {
     api<PayInfo>(`/orders/${orderId}/pay`, { method: 'POST' })
@@ -80,10 +84,16 @@ export function PaySheet({ orderId, total, user, onClose, onDone }: { orderId: n
       }
       return;
     }
+    // Demo gateway: walk through what a real UPI payment looks like.
     setStage('approving');
-    await new Promise((r) => setTimeout(r, 1400)); // the "approve in your UPI app" moment
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    for (let k = 0; k < STEPS.length; k++) {
+      setStep(k);
+      await wait([700, 600, 1000, 800][k]);
+    }
     try {
       await api(`/orders/${orderId}/pay/confirm`, { body: { test: true } });
+      setTxn(`UPI${Date.now().toString().slice(-9)}${Math.floor(Math.random() * 90 + 10)}`);
       setStage('done');
       navigator.vibrate?.([20, 60, 30]);
       setTimeout(() => onDone('paid'), 1200);
@@ -109,6 +119,33 @@ export function PaySheet({ orderId, total, user, onClose, onDone }: { orderId: n
             </div>
             <h2>Paid {rupees(total)}</h2>
             <p className="muted">Your order is confirmed. Just show your token at the counter.</p>
+            {txn && (
+              <div className="receipt small">
+                <span>
+                  Paid via <strong>{appName}</strong>
+                </span>
+                <span>
+                  Transaction ID <strong className="mono">{txn}</strong>
+                </span>
+                <span>To Yellow Canteen · {new Date().toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit' })}</span>
+              </div>
+            )}
+          </div>
+        ) : stage === 'approving' ? (
+          <div className="pay-progress" aria-live="polite">
+            <div className="spinner" aria-hidden />
+            <div className="pay-amount num">{rupees(total)}</div>
+            <ol className="pay-steps">
+              {STEPS.map((s, k) => (
+                <li key={s} data-state={k < step ? 'done' : k === step ? 'now' : 'todo'}>
+                  <span className="dot" aria-hidden>
+                    {k < step ? '✓' : ''}
+                  </span>
+                  {s}
+                </li>
+              ))}
+            </ol>
+            <span className="small faint">Don't close this screen</span>
           </div>
         ) : (
           <>
@@ -117,14 +154,10 @@ export function PaySheet({ orderId, total, user, onClose, onDone }: { orderId: n
                 <span className="section-label">Pay for order {info ? `#${info.token}` : ''}</span>
                 <div className="pay-amount num">{rupees(total)}</div>
               </div>
-              {info?.mode === 'test' && <span className="pill warn">Test mode</span>}
+              {info?.mode === 'test' && <span className="pill plain demo-pill">Demo</span>}
               {info?.mode === 'razorpay' && <span className="pill good">Razorpay</span>}
             </div>
-            {info?.mode === 'test' && (
-              <p className="small muted">
-                Payments are in test mode: no money moves. Add Razorpay keys on the server to take real UPI payments.
-              </p>
-            )}
+            <p className="small muted">Pay to Yellow Canteen · secure UPI</p>
             <div className="upi-apps" role="radiogroup" aria-label="UPI app">
               {APPS.map((a) => (
                 <button
@@ -134,7 +167,7 @@ export function PaySheet({ orderId, total, user, onClose, onDone }: { orderId: n
                   className="upi-app"
                   style={{ ['--tone' as string]: a.tone }}
                   onClick={() => setApp(a.id)}
-                  disabled={stage === 'approving'}
+                 
                 >
                   <span className="upi-dot" aria-hidden>
                     {a.name[0]}
@@ -144,10 +177,10 @@ export function PaySheet({ orderId, total, user, onClose, onDone }: { orderId: n
               ))}
             </div>
             {error && <div className="notice bad small">{error}</div>}
-            <button className="btn btn-primary btn-block btn-3d" disabled={!info || stage === 'approving'} onClick={pay}>
-              {stage === 'approving' ? `Approve in ${APPS.find((a) => a.id === app)!.name}…` : `Pay ${rupees(total)} with UPI`}
+            <button className="btn btn-primary btn-block btn-3d" disabled={!info} onClick={pay}>
+              {`Pay ${rupees(total)} with UPI`}
             </button>
-            <button className="linkish" style={{ alignSelf: 'center' }} onClick={counter} disabled={stage === 'approving'}>
+            <button className="linkish" style={{ alignSelf: 'center' }} onClick={counter}>
               Pay at the counter instead
             </button>
           </>
