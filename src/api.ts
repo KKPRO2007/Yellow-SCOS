@@ -15,6 +15,10 @@ export interface MenuItem {
   prepMinutes: number;
   veg: boolean;
   available: boolean;
+  manualAvailable?: boolean;
+  /** portions the live stock can still make (null = not tracked) */
+  left?: number | null;
+  soldOut?: 'manual' | 'stock' | null;
 }
 export interface Slot {
   slot: string;
@@ -40,7 +44,8 @@ export interface Order {
   readyAt: string | null;
   placedAt: string;
   customer: string | null;
-  items: { id: string; name: string; qty: number }[];
+  payment: 'unpaid' | 'paid' | 'counter';
+  items: { id: string; name: string; qty: number; for: string | null }[];
 }
 export interface Combo {
   items: { id: string; name: string; price: number }[];
@@ -88,15 +93,17 @@ export async function api<T = any>(path: string, opts: { method?: string; body?:
 
 // ---------------------------------------------------------------- live data
 
-type Topic = 'slots' | 'orders' | 'menu' | 'settings';
+type Topic = 'slots' | 'orders' | 'menu' | 'settings' | 'stock';
 export interface LiveEvent {
-  kind?: 'new' | 'status';
+  kind?: 'new' | 'status' | 'paid' | 'waitlist' | 'low' | 'restock';
+  userId?: number;
+  low?: { name: string; onHand: number; unit: string }[];
   id?: number;
   token?: number;
   slot?: string;
   slotLabel?: string;
   status?: string;
-  items?: { id: string; name: string; qty: number }[];
+  items?: { id: string; name: string; qty: number; for?: string | null }[];
 }
 const listeners = new Map<Topic, Set<(e: LiveEvent) => void>>();
 let source: EventSource | null = null;
@@ -105,7 +112,7 @@ const connListeners = new Set<(up: boolean) => void>();
 function ensureStream() {
   if (source) return;
   source = new EventSource('/api/stream');
-  for (const t of ['slots', 'orders', 'menu', 'settings'] as Topic[])
+  for (const t of ['slots', 'orders', 'menu', 'settings', 'stock'] as Topic[])
     source.addEventListener(t, (ev) => {
       let data: LiveEvent = {};
       try {

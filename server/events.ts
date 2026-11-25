@@ -9,7 +9,7 @@ import type { Db } from './db.js';
 // db mode (serverless, e.g. Vercel): the instance that handles an order is
 //   not the one holding the kitchen's connection, so publish appends to the
 //   `events` table and every stream tails it.
-export type Topic = 'slots' | 'orders' | 'menu' | 'settings';
+export type Topic = 'slots' | 'orders' | 'menu' | 'settings' | 'stock';
 
 const clients = new Set<Response>();
 let db: Db | null = null;

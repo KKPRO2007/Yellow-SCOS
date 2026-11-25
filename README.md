@@ -52,6 +52,15 @@ The judge fills 1:00–1:15 pm, then tries one more. Full slots stay tappable on
 - **Alerts.** The kitchen gets a chime, a toast and a system notification for new orders. Students get one when their order is ready.
 - Live sync to every screen through server-sent events. On Vercel these are backed by an `events` table so every instance sees them.
 
+## Product features
+
+- **UPI payment**: a payment sheet opens after placing an order. It runs in test mode (no money moves) until `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` are set; then it opens the real Razorpay checkout and verifies the signature on the server. Students can also choose *pay at the counter*; the kitchen sees *Paid by UPI* or *Collect ₹X*.
+- **Waitlist**: when a slot is full, the student taps *Notify me if it frees up*. A cancel in that slot alerts the first student waiting (in-app banner, sound, vibration, system notification), and they can book in one tap.
+- **Pick for me**: the student sets a class break and the app picks the quietest open slot inside it.
+- **Your usual**: the student's most frequent order and slot from their history, reordered in one tap. Any past order also has *Reorder*.
+- **Group order**: add up to 5 friends, add food per person, and see a split bill. The kitchen sees *for Rahul* on each line.
+- **Live stock**: every order uses up ingredients by recipe (checked atomically, so stock never goes negative). Cancels return them. Items sell out on their own, show *Only N left*, and trigger low-stock alerts in the kitchen. The shopkeeper logs the morning delivery and gets an **AI purchase order** (quantities from the forecast; Gemini or Groq writes the supplier message, ready to copy or send on WhatsApp).
+
 ## Deploy (Neon + Vercel)
 
 ```bash

@@ -42,7 +42,7 @@ interface Insights {
     marginPct: number;
   };
   insights: string[];
-  live: { orders: number; revenue: number; cost: number; profit: number; discount: number; ready: number; collected: number; cancelled: number };
+  live: { orders: number; revenue: number; cost: number; profit: number; discount: number; ready: number; collected: number; cancelled: number; paidOnline: number; dueAtCounter: number };
 }
 interface Briefing {
   headline: string;
@@ -203,6 +203,11 @@ function Stock({ a }: { a: Insights }) {
           An ML model (ridge regression on weekday, trend and last week) forecasts each item from past orders; recipes turn that into raw stock. Quantities use the
           upper end of the 80% range, so you run short at most about one day in ten.
         </p>
+      </div>
+
+      <div className="grid grid-2">
+        <LiveStock />
+        <PurchaseOrder />
       </div>
 
       <div className="grid grid-2">
@@ -370,6 +375,10 @@ function MoneyView({ a, reload }: { a: Insights; reload: () => void }) {
         <Kpi v={rupees(a.live.cost)} l="Food cost" />
         <Kpi v={rupees(a.live.profit)} l="Gross profit" sub={a.live.revenue ? `${((a.live.profit / a.live.revenue) * 100).toFixed(0)}% margin` : ''} />
         <Kpi v={rupees(a.live.discount)} l="Combo discounts given" sub={`${a.live.cancelled} cancelled`} />
+      </div>
+      <div className="kpis">
+        <Kpi v={rupees(a.live.paidOnline ?? 0)} l="Paid online (UPI)" sub="already in the bank" />
+        <Kpi v={rupees(a.live.dueAtCounter ?? 0)} l="Still to collect" sub="cash/UPI at the counter" />
       </div>
       <span className="section-label">Last {m.days.length} days</span>
       <div className="kpis">
@@ -700,6 +709,175 @@ function StaffCard() {
         </div>
         {msg && <span className="small muted">{msg}</span>}
       </form>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------- live stock & purchase order
+interface StockRow {
+  name: string;
+  unit: string;
+  onHand: number;
+  reorderLevel: number;
+  price: number;
+  status: 'ok' | 'low' | 'out';
+}
+
+function LiveStock() {
+  const st = useLive<{ stock: StockRow[] }>('/stock', ['stock', 'menu'], 30_000);
+  const [busy, setBusy] = useState(false);
+  const rows = [...(st.data?.stock ?? [])].sort((x, y) => (x.status === y.status ? x.name.localeCompare(y.name) : x.status === 'out' ? -1 : y.status === 'out' ? 1 : x.status === 'low' ? -1 : 1));
+  const restockAll = async () => {
+    if (!confirm('Log the morning delivery? Every ingredient is reset to today\'s forecast need + 15%.')) return;
+    setBusy(true);
+    st.setData(await api('/stock/restock', { body: { all: true } }).catch(() => st.data));
+    setBusy(false);
+  };
+  return (
+    <section className="card">
+      <div className="card-head">
+        <div>
+          <h2>Live stock</h2>
+          <span className="small faint">goes down with every order, back up on cancels</span>
+        </div>
+        <button className="btn btn-sm" disabled={busy} onClick={restockAll}>
+          Morning delivery
+        </button>
+      </div>
+      {!rows.length && <p className="small muted">No stock tracked yet. Log a delivery to start.</p>}
+      <table className="data">
+        <tbody>
+          {rows.map((g) => {
+            const full = Math.max(g.reorderLevel * 4, g.onHand, 0.001);
+            return (
+              <tr key={g.name}>
+                <td>
+                  {g.name}
+                  {g.status !== 'ok' && (
+                    <span className={`pill ${g.status === 'out' ? 'bad' : 'warn'}`} style={{ marginLeft: 6 }}>
+                      {g.status === 'out' ? 'Out' : 'Low'}
+                    </span>
+                  )}
+                </td>
+                <td style={{ width: '35%' }}>
+                  <div className={`stock-bar ${g.status}`}>
+                    <span style={{ width: `${Math.min(100, (g.onHand / full) * 100)}%` }} />
+                  </div>
+                </td>
+                <td className="r">
+                  <strong>{g.onHand}</strong> <span className="faint">{g.unit}</span>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+interface Po {
+  forDate: string;
+  total: number;
+  lines: { ingredient: string; unit: string; onHand: number; needTomorrow: number; qty: number; unitPrice: number; total: number }[];
+  draft: { summary: string; urgent: { ingredient: string; why: string }[]; message: string; source: string; model?: string; note?: string };
+}
+
+function PurchaseOrder() {
+  const [po, setPo] = useState<Po | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const make = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      setPo(await api<Po>('/stock/purchase-order', { method: 'POST' }));
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="card stack">
+      <div className="card-head" style={{ marginBottom: 0 }}>
+        <div>
+          <h2>AI purchase order</h2>
+          <span className="small faint">
+            {po
+              ? po.draft.source === 'rules'
+                ? 'Rule-based draft (no LLM reachable)'
+                : `Written by ${po.draft.source === 'gemini' ? 'Google Gemini' : po.draft.source === 'groq' ? 'Groq' : 'Claude'} · ${po.draft.model}`
+              : 'Quantities from the forecast; the AI writes the order'}
+          </span>
+        </div>
+        <button className="btn btn-sm btn-primary" disabled={busy} onClick={make}>
+          {busy ? 'Drafting…' : po ? 'Redraft' : 'Draft order'}
+        </button>
+      </div>
+      {err && <div className="notice bad small">{err}</div>}
+      {po && (
+        <>
+          <strong>{po.draft.summary}</strong>
+          {po.draft.urgent.length > 0 && (
+            <div className="stack" style={{ gap: 4 }}>
+              <span className="section-label">Urgent</span>
+              {po.draft.urgent.map((u) => (
+                <div key={u.ingredient} className="small">
+                  <span className="pill bad">{u.ingredient}</span> {u.why}
+                </div>
+              ))}
+            </div>
+          )}
+          <table className="data">
+            <thead>
+              <tr>
+                <th>Buy for {po.forDate}</th>
+                <th className="r">Qty</th>
+                <th className="r">₹</th>
+              </tr>
+            </thead>
+            <tbody>
+              {po.lines.map((l) => (
+                <tr key={l.ingredient}>
+                  <td>{l.ingredient}</td>
+                  <td className="r">
+                    {l.qty} <span className="faint">{l.unit}</span>
+                  </td>
+                  <td className="r">{rupees(l.total)}</td>
+                </tr>
+              ))}
+              <tr>
+                <td>
+                  <strong>Total</strong>
+                </td>
+                <td />
+                <td className="r">
+                  <strong>{rupees(po.total)}</strong>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <span className="section-label">Message to supplier</span>
+          <pre className="po-message">{po.draft.message}</pre>
+          <div className="row wrap">
+            <button
+              className="btn btn-sm"
+              onClick={async () => {
+                await navigator.clipboard?.writeText(po.draft.message).catch(() => {});
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              }}
+            >
+              {copied ? 'Copied' : 'Copy message'}
+            </button>
+            <a className="btn btn-sm" href={`https://wa.me/?text=${encodeURIComponent(po.draft.message)}`} target="_blank" rel="noreferrer">
+              Send on WhatsApp
+            </a>
+          </div>
+        </>
+      )}
     </section>
   );
 }

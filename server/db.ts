@@ -131,6 +131,33 @@ CREATE TABLE IF NOT EXISTS order_items (
 CREATE INDEX IF NOT EXISTS order_items_order ON order_items (order_id);
 ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS cost INT;
 
+-- Payments: 'unpaid' (just booked), 'paid' (UPI), 'counter' (pays at pickup).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'unpaid';
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_ref TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+-- Group orders: which friend each line is for (NULL = the buyer).
+ALTER TABLE order_items ADD COLUMN IF NOT EXISTS for_name TEXT;
+
+-- Students waiting for a full slot; the first one is told when a place frees.
+CREATE TABLE IF NOT EXISTS waitlist (
+  user_id      INT  NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  service_date TEXT NOT NULL,
+  slot_start   TEXT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  notified_at  TIMESTAMPTZ,
+  PRIMARY KEY (user_id, service_date, slot_start)
+);
+
+-- Raw stock on hand. Orders use it up through recipes; cancels give it back.
+CREATE TABLE IF NOT EXISTS ingredients (
+  name          TEXT PRIMARY KEY,
+  unit          TEXT NOT NULL,
+  on_hand       NUMERIC(12,3) NOT NULL DEFAULT 0,
+  reorder_level NUMERIC(12,3) NOT NULL DEFAULT 0,
+  price         NUMERIC(10,2) NOT NULL DEFAULT 0,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Change feed for live screens. In-process fan-out can't reach clients held by
 -- other serverless instances, so every instance tails this table instead.
 CREATE TABLE IF NOT EXISTS events (

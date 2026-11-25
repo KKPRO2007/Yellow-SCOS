@@ -98,39 +98,48 @@ export function aiProviders() {
 export async function briefing(a: Analysis, slots: SlotView[], force = false): Promise<BriefingT> {
   const key = `${a.today}:${Math.floor(Date.now() / 600_000)}`;
   if (!force && cached?.key === key) return cached.value;
-  const data = JSON.stringify(compact(a, slots));
-  const notes: string[] = [];
-  let value: BriefingT | null = null;
-  if (process.env.AI_DISABLED !== 'true') {
-    const chain: [string, () => Promise<{ text: string; model: string }>][] = [];
-    if (process.env.GEMINI_API_KEY) chain.push(['gemini', () => gemini(data)]);
-    if (process.env.GROQ_API_KEY) chain.push(['groq', () => groq(data)]);
-    if (process.env.ANTHROPIC_API_KEY) chain.push(['claude', () => claude(data)]);
-    // All configured providers run in parallel; the first valid answer wins.
-    // A busy model (Gemini 503s at peak) then costs nothing in latency.
-    const attempts = chain.map(async ([name, call]) => {
-      try {
-        const { text, model } = await withTimeout(call(), Number(process.env.LLM_TIMEOUT_MS ?? 20_000) + 10_000);
-        const parsed = Briefing.parse(JSON.parse(stripFences(text)));
-        return { ...parsed, source: name as BriefingT['source'], model };
-      } catch (err) {
-        notes.push(`${name} failed: ${describe(err)}.`);
-        throw err;
-      }
-    });
-    if (attempts.length) {
-      try {
-        const win = await Promise.any(attempts);
-        value = { ...win, note: notes.join(' ') || undefined, at: new Date().toISOString() };
-      } catch {
-        /* all failed: rules below */
-      }
-    }
-    if (!chain.length) notes.push('No LLM key set (GEMINI_API_KEY or GROQ_API_KEY).');
-  } else notes.push('AI is turned off (AI_DISABLED=true).');
-  value ??= { ...rules(a, slots), source: 'rules', note: `${notes.join(' ')} Showing the rule-based briefing.`, at: new Date().toISOString() };
+  const r = await llmJson(SYSTEM, `Today's data:\n${JSON.stringify(compact(a, slots))}`, Briefing);
+  const value: BriefingT = r.value
+    ? { ...r.value, source: r.source, model: r.model, note: r.note, at: new Date().toISOString() }
+    : { ...rules(a, slots), source: 'rules', note: `${r.note} Showing the rule-based briefing.`, at: new Date().toISOString() };
   cached = { key, value };
   return value;
+}
+
+type Source = 'gemini' | 'groq' | 'claude';
+
+/**
+ * Ask every configured provider at once and keep the first reply that parses
+ * into `schema`. A busy model (Gemini 503s at peak) then costs no latency.
+ */
+export async function llmJson<S extends z.ZodTypeAny>(
+  system: string,
+  user: string,
+  schema: S,
+): Promise<{ value: z.infer<S>; source: Source; model: string; note?: string } | { value: null; note: string }> {
+  if (process.env.AI_DISABLED === 'true') return { value: null, note: 'AI is turned off (AI_DISABLED=true).' };
+  const chain: [Source, () => Promise<{ text: string; model: string }>][] = [];
+  if (process.env.GEMINI_API_KEY) chain.push(['gemini', () => gemini(system, user)]);
+  if (process.env.GROQ_API_KEY) chain.push(['groq', () => groq(system, user)]);
+  if (process.env.ANTHROPIC_API_KEY) chain.push(['claude', () => claude(system, user)]);
+  if (!chain.length) return { value: null, note: 'No LLM key set (GEMINI_API_KEY or GROQ_API_KEY).' };
+  const notes: string[] = [];
+  try {
+    return await Promise.any(
+      chain.map(async ([name, call]) => {
+        try {
+          const { text, model } = await withTimeout(call(), Number(process.env.LLM_TIMEOUT_MS ?? 20_000) + 10_000);
+          const value = schema.parse(JSON.parse(stripFences(text)));
+          return { value, source: name, model, note: notes.join(' ') || undefined };
+        } catch (err) {
+          notes.push(`${name} failed: ${describe(err)}.`);
+          throw err;
+        }
+      }),
+    );
+  } catch {
+    return { value: null, note: notes.join(' ') };
+  }
 }
 
 function stripFences(t: string) {
@@ -168,13 +177,13 @@ async function postJson(url: string, headers: Record<string, string>, body: unkn
 }
 
 // Busy models (503/429) are common on free tiers: retry once, then try the next model.
-async function gemini(data: string) {
+async function gemini(system: string, user: string) {
   const models = (process.env.GEMINI_MODEL ?? 'gemini-flash-latest,gemini-2.5-flash,gemini-flash-lite-latest').split(',').map((m) => m.trim());
   let last: unknown;
   for (const model of models)
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        return await geminiOnce(data, model);
+        return await geminiOnce(system, user, model);
       } catch (err) {
         last = err;
         const busy = /HTTP (503|429|500)/.test(String((err as Error).message));
@@ -185,13 +194,13 @@ async function gemini(data: string) {
   throw last;
 }
 
-async function geminiOnce(data: string, model: string) {
+async function geminiOnce(system: string, user: string, model: string) {
   const j = await postJson(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
     { 'x-goog-api-key': process.env.GEMINI_API_KEY! },
     {
-      systemInstruction: { parts: [{ text: SYSTEM }] },
-      contents: [{ role: 'user', parts: [{ text: `Today's data:\n${data}` }] }],
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: 'user', parts: [{ text: user }] }],
       generationConfig: {
         responseMimeType: 'application/json',
         temperature: 0.4,
@@ -205,7 +214,7 @@ async function geminiOnce(data: string, model: string) {
   return { text, model: j.modelVersion ?? model };
 }
 
-async function groq(data: string) {
+async function groq(system: string, user: string) {
   const model = process.env.GROQ_MODEL ?? 'openai/gpt-oss-120b';
   const j = await postJson(
     'https://api.groq.com/openai/v1/chat/completions',
@@ -215,8 +224,8 @@ async function groq(data: string) {
       temperature: 0.4,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: SYSTEM },
-        { role: 'user', content: `Today's data:\n${data}` },
+        { role: 'system', content: system },
+        { role: 'user', content: user },
       ],
     },
   );
@@ -225,12 +234,12 @@ async function groq(data: string) {
   return { text, model: j.model ?? model };
 }
 
-async function claude(data: string) {
+async function claude(system: string, user: string) {
   const model = process.env.CLAUDE_MODEL ?? 'claude-opus-5-5';
   const j = await postJson(
     'https://api.anthropic.com/v1/messages',
     { 'x-api-key': process.env.ANTHROPIC_API_KEY!, 'anthropic-version': '2023-06-01' },
-    { model, max_tokens: 4000, system: SYSTEM, messages: [{ role: 'user', content: `Today's data:\n${data}` }] },
+    { model, max_tokens: 4000, system, messages: [{ role: 'user', content: user }] },
   );
   const text = (j.content ?? []).filter((b: { type: string }) => b.type === 'text').map((b: { text: string }) => b.text).join('');
   if (!text) throw new Error(`empty reply (${j.stop_reason})`);
@@ -270,5 +279,38 @@ function rules(a: Analysis, slots: SlotView[]): B {
       ...(fc && fc.high > a.avgOrdersPerDay * 1.15 ? ['Demand could run well above average; watch stock of the top items.'] : []),
       ...(overflow.length > 2 ? [`${overflow.length} slots are forecast above capacity; students will be pushed to later slots.`] : []),
     ],
+  };
+}
+
+// ---------------------------------------------------------------- purchase order
+const PurchaseNote = z.object({
+  summary: z.string().min(5),
+  urgent: list(z.object({ ingredient: text, why: text }), 6),
+  message: z.string().min(10),
+});
+export type PurchaseNoteT = z.infer<typeof PurchaseNote> & { source: Source | 'rules'; model?: string; note?: string };
+
+const PO_SYSTEM =
+  'You are the purchasing assistant for a college canteen. You get a purchase list the code already computed ' +
+  '(quantities = tomorrow\'s upper demand forecast + 15% minus stock on hand, wholesale prices in rupees) and the live ' +
+  'stock levels. Never change quantities or prices. Write: a one-line summary for the shopkeeper; which items are urgent ' +
+  '(already low or out today) and why; and a short, polite WhatsApp message to the supplier listing every line with ' +
+  'quantity and unit, asking for delivery before 9:30 am. Reply with JSON only: ' +
+  '{"summary": "...", "urgent": [{"ingredient": "...", "why": "..."}], "message": "..."}';
+
+export async function purchaseNote(
+  po: { lines: { ingredient: string; unit: string; qty: number; total: number; onHand: number }[]; total: number; forDate: string },
+  stock: { name: string; status: string; onHand: number; unit: string }[],
+): Promise<PurchaseNoteT> {
+  const low = stock.filter((x) => x.status !== 'ok');
+  const r = await llmJson(PO_SYSTEM, JSON.stringify({ deliverFor: po.forDate, lines: po.lines, totalINR: po.total, lowOrOutNow: low }), PurchaseNote);
+  if (r.value) return { ...r.value, source: r.source, model: r.model, note: r.note };
+  const fmt = (l: { ingredient: string; qty: number; unit: string }) => `${l.ingredient}: ${l.qty} ${l.unit}`;
+  return {
+    source: 'rules',
+    note: `${r.note} Showing the rule-based draft.`,
+    summary: `${po.lines.length} items to buy for ${po.forDate}, about ₹${po.total.toLocaleString('en-IN')}.`,
+    urgent: low.map((x) => ({ ingredient: x.name, why: x.status === 'out' ? 'Out of stock now.' : `Only ${x.onHand} ${x.unit} left.` })),
+    message: `Hello, please deliver before 9:30 am on ${po.forDate}:\n${po.lines.map(fmt).join('\n')}\nThank you, Yellow Canteen.`,
   };
 }

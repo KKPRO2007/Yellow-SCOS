@@ -158,6 +158,24 @@ export async function seed(db: Db, today = localNow().date) {
     const have = new Set((await q<{ d: string }>(`SELECT DISTINCT service_date AS d FROM orders WHERE service_date < $1`, [today])).map((r) => r.d));
     const missing = generateHistory(today).filter((o) => !have.has(o.date));
     if (missing.length) await insertHistory(q, missing);
+    await q(`UPDATE orders SET payment_status = 'paid' WHERE source = 'history' AND payment_status = 'unpaid'`);
+
+    // Give the demo student some habits, so "Your usual" has something to learn.
+    const [k] = await q<{ id: number }>(`SELECT id FROM users WHERE email = 'buyer@demo.test'`);
+    if (k) {
+      const [{ n }] = await q<{ n: number }>(`SELECT COUNT(*)::int AS n FROM orders WHERE user_id = $1 AND source = 'history'`, [k.id]);
+      if (!n)
+        await q(
+          `UPDATE orders SET user_id = $1 WHERE id IN (
+             SELECT o.id FROM orders o
+              WHERE o.source = 'history' AND o.user_id IS NULL AND o.slot_start = '13:15'
+                AND (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) = 2
+                AND EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.item_id = 'samosa')
+                AND EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = o.id AND i.item_id = 'chai')
+              ORDER BY o.service_date DESC LIMIT 14)`,
+          [k.id],
+        );
+    }
   });
 }
 
@@ -180,7 +198,7 @@ async function insertHistory(q: Query, orders: GenOrder[]) {
       const placed = localToDate(o.date, o.minute - 20);
       const ready = localToDate(o.date, o.minute);
       const p = oVals.length;
-      oRows.push(`($${p + 1},$${p + 2},$${p + 3},$${p + 4},$${p + 5},'collected',$${p + 6},$${p + 7},$${p + 7},'history')`);
+      oRows.push(`($${p + 1},$${p + 2},$${p + 3},$${p + 4},$${p + 5},'collected',$${p + 6},$${p + 7},$${p + 7},'history','paid')`);
       oVals.push(id, token, o.date, o.slot, placed, total, ready);
       for (const it of o.items) {
         const k = iVals.length;
@@ -189,7 +207,7 @@ async function insertHistory(q: Query, orders: GenOrder[]) {
       }
     }
     await q(
-      `INSERT INTO orders (id, token_no, service_date, slot_start, placed_at, status, total, ready_eta, ready_at, source)
+      `INSERT INTO orders (id, token_no, service_date, slot_start, placed_at, status, total, ready_eta, ready_at, source, payment_status)
        VALUES ${oRows.join(',')}`,
       oVals,
     );
@@ -212,6 +230,12 @@ export const UNITS: Record<string, string> = {
   'Mixed veg': 'kg', 'Noodle packs': 'packs', 'Dosa batter': 'kg', Rice: 'kg', Dal: 'kg', 'Atta (wheat)': 'kg',
   Chickpeas: 'kg', Paneer: 'kg', Milk: 'L', 'Tea leaves': 'kg', Sugar: 'kg', Coffee: 'kg', Limes: 'pcs', Soda: 'L',
   'Gulab jamun (ready)': 'pcs',
+};
+// Wholesale price per unit (₹), for purchase orders.
+export const PRICES: Record<string, number> = {
+  Potatoes: 30, 'Maida (flour)': 45, 'Cooking oil': 150, Pav: 4, Besan: 90, 'Puff pastry': 12, 'Mixed veg': 60,
+  'Noodle packs': 14, 'Dosa batter': 70, Rice: 60, Dal: 120, 'Atta (wheat)': 40, Chickpeas: 100, Paneer: 380, Milk: 56,
+  'Tea leaves': 500, Sugar: 44, Coffee: 900, Limes: 5, Soda: 40, 'Gulab jamun (ready)': 6,
 };
 export const RECIPES: Record<string, Record<string, number>> = {
   samosa: { Potatoes: 0.08, 'Maida (flour)': 0.05, 'Cooking oil': 0.03 },

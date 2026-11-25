@@ -12,6 +12,7 @@ What we asked the AI, and what it got wrong. Add to this as you go; the pitch ne
 | 6 | Backend | LLM briefing via Gemini | `gemini-flash-latest` returned 503 "high demand" at peak | Retry once, then fall back to `gemini-2.5-flash` and `gemini-flash-lite-latest`, then rules |
 | 7 | UI | Real food photos | Wikipedia's "Maggi" image is the brand logo; "Biryani" was a chicken dum biryani on a menu item marked veg; "cold coffee" came back as an affogato | Picked CC-licensed Commons photos by hand, checked each by eye, and credited them in the app |
 | 8 | Backend | Live updates on Vercel | In-memory server-sent events only reach clients on the same instance; serverless has many | Events go through a Postgres `events` table that each stream tails |
+| 9 | UI | Mobile kitchen board | Swipeable slot columns stretched the grid, making the page 2,198px tall on a 390px phone and hiding the tab bar | `min-width: 0` on grid children, plus a guard against sideways overflow |
 
 ## Best prompt (for the pitch)
 

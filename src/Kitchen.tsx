@@ -1,5 +1,14 @@
 import { useState } from 'react';
-import { api, chime, clock, notify, useEvent, useLive, type LiveEvent, type MenuItem, type Order, type Slot, type User } from './api';
+import { api, chime, clock, notify, rupees, useEvent, useLive, type LiveEvent, type MenuItem, type Order, type Slot, type User } from './api';
+
+interface StockRow {
+  name: string;
+  unit: string;
+  onHand: number;
+  reorderLevel: number;
+  status: 'ok' | 'low' | 'out';
+  usedBy: string[];
+}
 
 interface KitchenData {
   today: string;
@@ -16,14 +25,34 @@ interface KitchenData {
 }
 
 const NEXT: Record<string, { to: Order['status']; label: string } | undefined> = {
-  placed: { to: 'cooking', label: 'Start' },
-  cooking: { to: 'ready', label: 'Ready' },
-  ready: { to: 'collected', label: 'Collected' },
+  placed: { to: 'cooking', label: 'Start cooking' },
+  cooking: { to: 'ready', label: 'Mark ready' },
+  ready: { to: 'collected', label: 'Handed over' },
 };
 
 export function Kitchen({ user }: { user: User }) {
   const k = useLive<KitchenData>('/kitchen', ['orders', 'slots', 'menu', 'settings'], 60_000);
   const menu = useLive<MenuItem[]>('/menu', ['menu']);
+  const stock = useLive<{ stock: StockRow[]; left: Record<string, number | null> }>('/stock', ['stock', 'menu'], 30_000);
+  const [lowAlert, setLowAlert] = useState<string | null>(null);
+  useEvent('stock', (e) => {
+    if (e.kind !== 'low' || !e.low?.length) return;
+    const msg = `Low stock: ${e.low.map((l) => `${l.name} (${l.onHand} ${l.unit} left)`).join(', ')}`;
+    setLowAlert(msg);
+    chime();
+    notify('Low stock', msg);
+  });
+  async function restock(name: string, unit: string) {
+    const raw = prompt(`Add how much ${name} (${unit})?`);
+    const qty = Number(raw);
+    if (!raw || !(qty > 0)) return;
+    try {
+      stock.setData(await api('/stock/restock', { body: { name, qty } }));
+      setLowAlert(null);
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  }
   const [showAll, setShowAll] = useState(false);
   const [pending, setPending] = useState<Set<number>>(new Set());
   const [toasts, setToasts] = useState<(LiveEvent & { at: number })[]>([]);
@@ -88,6 +117,15 @@ export function Kitchen({ user }: { user: User }) {
         </div>
       </div>
 
+      {lowAlert && (
+        <div className="notice bad row between wrap" role="alert">
+          <strong>{lowAlert}</strong>
+          <button className="linkish" onClick={() => setLowAlert(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
       <div className="toasts" aria-live="polite">
         {toasts.map((t) => (
           <div key={t.at + String(t.id)} className="toast">
@@ -95,7 +133,26 @@ export function Kitchen({ user }: { user: User }) {
               <strong>New order #{t.token}</strong>
               <span className="small">{t.slotLabel}</span>
             </div>
-            <div className="small">{(t.items ?? []).map((i) => `${i.qty}× ${i.name}`).join(', ')}</div>
+            <div className="small">{(t.items ?? []).map((i) => `${i.qty}× ${i.name}${i.for ? ` (${i.for})` : ''}`).join(', ')}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="flow" aria-label="Order stages">
+        {(
+          [
+            ['placed', 'New', 'Not started'],
+            ['cooking', 'Cooking', 'On the stove'],
+            ['ready', 'Ready', 'Waiting for student'],
+          ] as const
+        ).map(([st, name, hint], k) => (
+          <div key={st} className="flow-step" data-status={st}>
+            <strong className="num">{orders.filter((o) => o.status === st).length}</strong>
+            <span>
+              {name}
+              <small>{hint}</small>
+            </span>
+            {k < 2 && <span className="flow-arrow" aria-hidden>→</span>}
           </div>
         ))}
       </div>
@@ -155,30 +212,40 @@ export function Kitchen({ user }: { user: User }) {
                       const next = NEXT[o.status];
                       return (
                         <div key={o.id} className="korder" data-status={o.status}>
-                          <div className="row between">
-                            <span className="mono" style={{ fontWeight: 700 }}>
-                              #{o.token}
+                          <div className="korder-head">
+                            <span className="ktoken">#{o.token}</span>
+                            <span className="kwho">
+                              <strong>{o.customer ?? 'Walk-in'}</strong>
+                              <small>ready by {clock(o.readyEta)}</small>
                             </span>
-                            <span className="small faint">
-                              {o.customer ?? 'Walk-in'} · ready {clock(o.readyEta)}
-                            </span>
+                            <span className={`kstate ${o.status}`}>{o.status === 'placed' ? 'New' : o.status === 'cooking' ? 'Cooking' : 'Ready'}</span>
                           </div>
-                          <ul>
-                            {o.items.map((i) => (
-                              <li key={i.id}>
-                                {i.qty}× {i.name}
+                          <ul className="kitems">
+                            {o.items.map((i, k) => (
+                              <li key={`${i.id}-${i.for ?? ''}-${k}`}>
+                                <img src={`/food/${i.id}.jpg`} alt="" />
+                                <span className="kqty">{i.qty}×</span>
+                                <span className="grow">{i.name}</span>
+                                {i.for && <span className="for-tag">for {i.for}</span>}
                               </li>
                             ))}
                           </ul>
-                          {next && (
-                            <button
-                              className={`btn btn-sm ${o.status === 'cooking' ? 'btn-primary' : ''}`}
-                              disabled={pending.has(o.id)}
-                              onClick={() => move([o.id], next.to)}
-                            >
-                              {next.label}
-                            </button>
-                          )}
+                          <div className="korder-foot">
+                            {o.payment === 'paid' ? (
+                              <span className="pill good">Paid by UPI</span>
+                            ) : (
+                              <span className="pill warn">Collect {rupees(o.total)} cash/UPI</span>
+                            )}
+                            {next && (
+                              <button
+                                className={`btn btn-sm kaction ${o.status}`}
+                                disabled={pending.has(o.id)}
+                                onClick={() => move([o.id], next.to)}
+                              >
+                                {next.label}
+                              </button>
+                            )}
+                          </div>
                         </div>
                       );
                     })}
@@ -227,29 +294,63 @@ export function Kitchen({ user }: { user: User }) {
             ))}
           </section>
 
+          {(stock.data?.stock ?? []).some((g) => g.status !== 'ok') && (
+            <section className="card stock-alert">
+              <div className="card-head">
+                <h2>Running low</h2>
+                <span className="small faint">live, from every order</span>
+              </div>
+              {(stock.data?.stock ?? [])
+                .filter((g) => g.status !== 'ok')
+                .map((g) => (
+                  <div key={g.name} className="toggle-row">
+                    <span>
+                      <strong>{g.name}</strong>{' '}
+                      <span className={`pill ${g.status === 'out' ? 'bad' : 'warn'}`}>
+                        {g.status === 'out' ? 'Out' : `${g.onHand} ${g.unit} left`}
+                      </span>
+                    </span>
+                    <button className="btn btn-sm" onClick={() => restock(g.name, g.unit)}>
+                      + Restock
+                    </button>
+                  </div>
+                ))}
+            </section>
+          )}
+
           <section className="card">
             <div className="card-head">
-              <h2>Stock</h2>
-              <span className="small faint">tap to mark sold out</span>
+              <h2>Menu & portions</h2>
+              <span className="small faint">switch off to mark sold out</span>
             </div>
-            {(menu.data ?? []).map((m) => (
-              <div key={m.id} className="toggle-row">
-                <span className={m.available ? '' : 'faint'}>
-                  {m.name}
-                  {!m.available && <span className="pill bad" style={{ marginLeft: 6 }}>Sold out</span>}
-                </span>
-                <button
-                  className="switch"
-                  role="switch"
-                  aria-checked={m.available}
-                  aria-label={`${m.name} available`}
-                  onClick={async () => {
-                    menu.setData((d) => d && d.map((x) => (x.id === m.id ? { ...x, available: !m.available } : x)));
-                    await api(`/menu/${m.id}`, { method: 'PATCH', body: { available: !m.available } }).catch((e) => alert(e.message));
-                  }}
-                />
-              </div>
-            ))}
+            {(menu.data ?? []).map((m) => {
+              const on = m.manualAvailable ?? m.available;
+              const left = stock.data?.left[m.id] ?? m.left ?? null;
+              return (
+                <div key={m.id} className="toggle-row">
+                  <span className={m.available ? '' : 'faint'}>
+                    {m.name}{' '}
+                    {m.soldOut === 'stock' ? (
+                      <span className="pill bad">Out of stock</span>
+                    ) : !on ? (
+                      <span className="pill bad">Switched off</span>
+                    ) : left != null ? (
+                      <span className={`pill ${left <= 5 ? 'warn' : 'plain'}`}>{left} portions</span>
+                    ) : null}
+                  </span>
+                  <button
+                    className="switch"
+                    role="switch"
+                    aria-checked={on}
+                    aria-label={`${m.name} available`}
+                    onClick={async () => {
+                      menu.setData((d) => d && d.map((x) => (x.id === m.id ? { ...x, manualAvailable: !on, available: !on && x.soldOut !== 'stock' } : x)));
+                      await api(`/menu/${m.id}`, { method: 'PATCH', body: { available: !on } }).catch((e) => alert(e.message));
+                    }}
+                  />
+                </div>
+              );
+            })}
           </section>
         </aside>
       </div>

@@ -2,16 +2,9 @@ import type { Db, Query } from './db.js';
 import { getAnalysis } from './analytics.js';
 import { SLOT_LEN, SLOT_STARTS, localNow, localToDate, slotLabel, toMin } from './time.js';
 
-export class HttpError extends Error {
-  constructor(
-    public status: number,
-    public code: string,
-    message: string,
-    public extra: Record<string, unknown> = {},
-  ) {
-    super(message);
-  }
-}
+import { HttpError } from './errors.js';
+import { restockForDay, returnStock, takeStock } from './stock.js';
+export { HttpError };
 
 export async function getSettings(q: Query) {
   const rows = await q<{ key: string; value: string }>(`SELECT key, value FROM settings`);
@@ -76,7 +69,8 @@ function nextOpen(views: SlotView[], after: string, count = 3) {
 export interface PlaceInput {
   userId: number | null;
   slot: string;
-  items: { id: string; qty: number }[];
+  /** `for` names the friend a line is for in a group order (omit for yourself). */
+  items: { id: string; qty: number; for?: string }[];
   source?: 'app' | 'seed';
   date?: string;
 }
@@ -89,14 +83,23 @@ export interface PlaceInput {
 export async function placeOrder(db: Db, input: PlaceInput) {
   const date = input.date ?? localNow().date;
   if (!SLOT_STARTS.includes(input.slot)) throw new HttpError(400, 'BAD_SLOT', 'That pickup slot does not exist.');
+  // lines: item id -> total qty; people: "for" name + item id -> qty (group orders).
   const lines = new Map<string, number>();
-  for (const it of input.items ?? []) {
-    const qty = Math.floor(Number(it.qty));
+  const people = new Map<string, { id: string; for: string | null; qty: number }>();
+  for (const it of Array.isArray(input.items) ? input.items : []) {
+    const qty = Math.floor(Number(it?.qty));
     if (!it?.id || !(qty > 0)) throw new HttpError(400, 'BAD_ITEMS', 'Each item needs an id and a quantity.');
+    const who = typeof it.for === 'string' && it.for.trim() ? it.for.trim().slice(0, 30) : null;
     lines.set(it.id, (lines.get(it.id) ?? 0) + qty);
+    const key = `${who ?? ''}\u0000${it.id}`;
+    people.set(key, { id: it.id, for: who, qty: (people.get(key)?.qty ?? 0) + qty });
   }
   if (!lines.size) throw new HttpError(400, 'EMPTY', 'Add at least one item.');
-  if ([...lines.values()].reduce((a, b) => a + b, 0) > 12) throw new HttpError(400, 'TOO_MANY', 'Up to 12 items per order.');
+  const groupSize = new Set([...people.values()].map((p) => p.for ?? '')).size;
+  if (groupSize > 6) throw new HttpError(400, 'GROUP_TOO_BIG', 'A group order is for up to 6 people.');
+  const maxItems = groupSize > 1 ? 30 : 12;
+  if ([...lines.values()].reduce((a, b) => a + b, 0) > maxItems)
+    throw new HttpError(400, 'TOO_MANY', `Up to ${maxItems} items per ${groupSize > 1 ? 'group ' : ''}order.`);
 
   const settings = await getSettings(db.query);
   const now = localNow();
@@ -139,6 +142,8 @@ export async function placeOrder(db: Db, input: PlaceInput) {
       );
       if (!taken[0]) throw new HttpError(409, 'SLOT_FULL', `${slotLabel(input.slot)} is full.`, { slot: input.slot });
 
+      const lowStock = await takeStock(q, lines, Object.fromEntries(menu.map((m) => [m.id, m.name])));
+
       const [{ n: token }] = await q<{ n: number }>(
         `INSERT INTO day_counters (service_date, n) VALUES ($1, 1)
          ON CONFLICT (service_date) DO UPDATE SET n = day_counters.n + 1 RETURNING n`,
@@ -154,17 +159,21 @@ export async function placeOrder(db: Db, input: PlaceInput) {
       if (eta < earliest) eta = earliest;
 
       const [order] = await q<{ id: number }>(
-        `INSERT INTO orders (token_no, user_id, service_date, slot_start, total, discount, ready_eta, source)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-        [token, input.userId, date, input.slot, subtotal - discount, discount, eta, input.source ?? 'app'],
+        `INSERT INTO orders (token_no, user_id, service_date, slot_start, total, discount, ready_eta, source, payment_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+        [token, input.userId, date, input.slot, subtotal - discount, discount, eta, input.source ?? 'app', input.source === 'seed' ? 'counter' : 'unpaid'],
       );
-      for (const m of menu)
-        await q(`INSERT INTO order_items (order_id, item_id, qty, unit_price) VALUES ($1,$2,$3,$4)`, [
+      for (const p of people.values())
+        await q(`INSERT INTO order_items (order_id, item_id, qty, unit_price, for_name) VALUES ($1,$2,$3,$4,$5)`, [
           order.id,
-          m.id,
-          lines.get(m.id),
-          m.price,
+          p.id,
+          p.qty,
+          menu.find((m) => m.id === p.id)!.price,
+          p.for,
         ]);
+      // Booked it: leave the waitlist for this slot.
+      if (input.userId)
+        await q(`DELETE FROM waitlist WHERE user_id = $1 AND service_date = $2 AND slot_start = $3`, [input.userId, date, input.slot]);
       return {
         id: order.id,
         token,
@@ -173,7 +182,8 @@ export async function placeOrder(db: Db, input: PlaceInput) {
         total: subtotal - discount,
         discount,
         readyEta: eta.toISOString(),
-        items: menu.map((m) => ({ id: m.id, name: m.name, qty: lines.get(m.id)! })),
+        items: [...people.values()].map((p) => ({ id: p.id, name: menu.find((m) => m.id === p.id)!.name, qty: p.qty, for: p.for })),
+        lowStock,
       };
     });
   } catch (err) {
@@ -214,12 +224,14 @@ export async function setStatus(db: Db, id: number, status: string, byUserId?: n
       `UPDATE orders SET status = $2, ready_at = CASE WHEN $2 = 'ready' THEN now() ELSE ready_at END WHERE id = $1`,
       [id, status],
     );
-    if (status === 'cancelled')
+    if (status === 'cancelled') {
       await q(`UPDATE slots SET booked = GREATEST(0, booked - 1) WHERE service_date = $1 AND slot_start = $2`, [
         o.service_date,
         o.slot_start,
       ]);
-    return { id, status };
+      await returnStock(q, id);
+    }
+    return { id, status, date: o.service_date, slot: o.slot_start };
   });
 }
 
@@ -227,7 +239,6 @@ export async function setStatus(db: Db, id: number, status: string, byUserId?: n
 export async function seedToday(db: Db, force = false) {
   const settings = await getSettings(db.query);
   const today = localNow().date;
-  if (!settings.seedBookings) return 0;
   // Claim today's pre-fill atomically: only one instance (or one reset) wins.
   await db.query(`INSERT INTO settings (key, value) VALUES ('seeded_date', '') ON CONFLICT (key) DO NOTHING`);
   const claimed = await db.query(
@@ -235,6 +246,8 @@ export async function seedToday(db: Db, force = false) {
     [today, force],
   );
   if (!claimed.length) return 0;
+  await restockForDay(db); // the morning delivery
+  if (!settings.seedBookings) return 0;
   const [{ n }] = await db.query<{ n: number }>(`SELECT COUNT(*)::int AS n FROM orders WHERE service_date = $1`, [today]);
   if (n > 0) return 0;
   const plan = (await getAnalysis(db)).todayPlan;
@@ -250,8 +263,12 @@ export async function seedToday(db: Db, force = false) {
       let r = rand() * total;
       const pickId = ids.find(([, v]) => (r -= v) <= 0)?.[0] ?? ids[0]?.[0];
       if (!pickId) break;
-      await placeOrder(db, { userId: null, slot: s.slot, items: [{ id: pickId, qty: 1 }], source: 'seed', date: today });
-      placed++;
+      try {
+        await placeOrder(db, { userId: null, slot: s.slot, items: [{ id: pickId, qty: 1 }], source: 'seed', date: today });
+        placed++;
+      } catch (err) {
+        if (!(err instanceof HttpError && err.code === 'OUT_OF_STOCK')) throw err;
+      }
     }
   }
   return placed;
