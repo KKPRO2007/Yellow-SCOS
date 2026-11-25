@@ -54,6 +54,8 @@ export function Kitchen({ user }: { user: User }) {
     }
   }
   const [showAll, setShowAll] = useState(false);
+  const [query, setQuery] = useState('');
+  const [slotFilter, setSlotFilter] = useState('');
   const [pending, setPending] = useState<Set<number>>(new Set());
   const [toasts, setToasts] = useState<(LiveEvent & { at: number })[]>([]);
   const [sound, setSound] = useState(true);
@@ -82,12 +84,22 @@ export function Kitchen({ user }: { user: User }) {
   }
 
   // Columns: every slot with open orders, from the earliest unfinished one.
+  // Search: "#192" / "192" finds a token; letters search names (student or friend).
+  const q = query.trim().toLowerCase().replace(/^#/, '');
+  const searching = Boolean(q || slotFilter);
+  const shownOrders = orders.filter((o) => {
+    if (slotFilter && o.slot !== slotFilter) return false;
+    if (!q) return true;
+    if (/^\d+$/.test(q)) return String(o.token).startsWith(q);
+    return (o.customer ?? 'walk-in').toLowerCase().includes(q) || o.items.some((i) => (i.for ?? '').toLowerCase().includes(q) || i.name.toLowerCase().includes(q));
+  });
+  const exact = /^\d+$/.test(q) ? orders.find((o) => String(o.token) === q) : undefined;
   const bySlot = new Map<string, Order[]>();
-  for (const o of orders) bySlot.set(o.slot, [...(bySlot.get(o.slot) ?? []), o]);
+  for (const o of shownOrders) bySlot.set(o.slot, [...(bySlot.get(o.slot) ?? []), o]);
   const slotKeys = [...bySlot.keys()].sort();
   const late = slotKeys.filter((s) => s < current && bySlot.get(s)!.some((o) => o.status !== 'ready'));
   const cols = [...new Set([...late, ...slotKeys.filter((s) => s >= current)])];
-  const visible = showAll ? cols : cols.slice(0, 4);
+  const visible = showAll || searching ? cols : cols.slice(0, 4);
 
   // "Cook next": what is booked and not yet ready in the first column.
   const focus = visible[0];
@@ -138,6 +150,55 @@ export function Kitchen({ user }: { user: User }) {
         ))}
       </div>
 
+      <div className="ksearch" role="search">
+        <div className="ksearch-box">
+          <span aria-hidden>⌕</span>
+          <input
+            className="input"
+            type="search"
+            inputMode="search"
+            placeholder="Find token #192, student or item"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Search orders by token, name or item"
+          />
+        </div>
+        <select className="input ksearch-slot" value={slotFilter} onChange={(e) => setSlotFilter(e.target.value)} aria-label="Filter by pickup time">
+          <option value="">All pickup times</option>
+          {k.data.slots.map((sl) => {
+            const n = orders.filter((o) => o.slot === sl.slot).length;
+            return (
+              <option key={sl.slot} value={sl.slot}>
+                {sl.label}
+                {n ? ` · ${n} open` : ''}
+              </option>
+            );
+          })}
+        </select>
+        {searching && (
+          <button className="btn btn-sm" onClick={() => (setQuery(''), setSlotFilter(''))}>
+            Clear
+          </button>
+        )}
+      </div>
+      {searching && (
+        <div className={`notice small ${shownOrders.length ? '' : 'bad'}`}>
+          {exact ? (
+            <>
+              Token <strong>#{exact.token}</strong>: {exact.customer ?? 'Walk-in'}, pickup {exact.slotLabel}, {exact.status === 'placed' ? 'not started' : exact.status},{' '}
+              {exact.payment === 'paid' ? 'paid' : `collect ${rupees(exact.total)}`}.
+            </>
+          ) : shownOrders.length ? (
+            <>
+              {shownOrders.length} order{shownOrders.length > 1 ? 's' : ''} found
+              {slotFilter ? ` for ${k.data.slots.find((x) => x.slot === slotFilter)?.label}` : ''}.
+            </>
+          ) : (
+            <>No open order matches. Collected and cancelled orders are not shown here.</>
+          )}
+        </div>
+      )}
+
       <div className="flow" aria-label="Order stages">
         {(
           [
@@ -181,7 +242,7 @@ export function Kitchen({ user }: { user: User }) {
 
       <div className="grid grid-kitchen">
         <section aria-label="Orders by slot" className="stack">
-          {cols.length === 0 && <div className="card muted">No open orders. New ones appear here instantly.</div>}
+          {cols.length === 0 && !searching && <div className="card muted">No open orders. New ones appear here instantly.</div>}
           <div className="board">
             {visible.map((s) => {
               const list = bySlot.get(s)!;
@@ -211,7 +272,7 @@ export function Kitchen({ user }: { user: User }) {
                     {list.map((o) => {
                       const next = NEXT[o.status];
                       return (
-                        <div key={o.id} className="korder" data-status={o.status}>
+                        <div key={o.id} className="korder" data-status={o.status} data-hit={exact?.id === o.id}>
                           <div className="korder-head">
                             <span className="ktoken">#{o.token}</span>
                             <span className="kwho">
