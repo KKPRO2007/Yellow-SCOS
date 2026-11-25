@@ -256,7 +256,8 @@ export async function seedToday(db: Db, force = false) {
   let seed = 7;
   const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
   for (const s of plan.slots) {
-    const target = Math.min(settings.slotCapacity - 5, Math.round(s.orders * 0.35));
+    // Sample bookings fill at most half of a slot, so students always have free places.
+    const target = Math.min(Math.floor(settings.slotCapacity / 2), Math.round(s.orders * 0.35));
     const ids = Object.entries(s.items).filter(([id]) => menu.some((m) => m.id === id));
     const total = ids.reduce((a, [, v]) => a + v, 0) || 1;
     for (let k = 0; k < target; k++) {
